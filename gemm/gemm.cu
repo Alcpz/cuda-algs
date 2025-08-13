@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <cuda.h>
 #include <iostream>
 #include <numeric>
@@ -151,9 +152,46 @@ __global__ void naive_gemm(const float *__restrict__ A,
 }
 
 constexpr int TILE_SIZE = 16;
+
 __global__ void shmem_gemm(const float *__restrict__ A,
                            const float *__restrict__ B, float *__restrict__ C,
                            int M, int N, int K) {
+  int row = threadIdx.y + blockDim.y * blockIdx.y;
+  int col = threadIdx.x + blockDim.x * blockIdx.x;
+
+  // Load into shared mem
+  __shared__ float sh_a[TILE_SIZE][TILE_SIZE];
+  __shared__ float sh_b[TILE_SIZE][TILE_SIZE];
+
+  float acc = 0.0f;
+  for (int v = 0; v < K; v += TILE_SIZE) {
+    int tile_a_col = threadIdx.x + v;
+    int tile_b_row = threadIdx.y + v;
+    if (row < M && tile_a_col < K)
+      sh_a[threadIdx.y][threadIdx.x] = A[row * K + tile_a_col];
+    else
+      sh_a[threadIdx.y][threadIdx.x] = 0.0f;
+    if (col < N && tile_b_row < K)
+      sh_b[threadIdx.y][threadIdx.x] = B[tile_b_row * N + col];
+    else
+      sh_b[threadIdx.y][threadIdx.x] = 0.0f;
+    __syncthreads();
+
+#pragma unroll
+    for (int n = 0; n < TILE_SIZE; n++) {
+      acc += sh_a[threadIdx.y][n] * sh_b[n][threadIdx.x];
+    }
+    __syncthreads();
+  }
+
+  if (row < M && col < N)
+    C[row * N + col] = acc;
+}
+
+__global__ void buffered_shmem_gemm(const float *__restrict__ A,
+                                    const float *__restrict__ B,
+                                    float *__restrict__ C, int M, int N,
+                                    int K) {
   int row = threadIdx.y + blockDim.y * blockIdx.y;
   int col = threadIdx.x + blockDim.x * blockIdx.x;
 
@@ -192,8 +230,6 @@ __global__ void shmem_gemm(const float *__restrict__ A,
         sh_b[next][threadIdx.y][threadIdx.x] = 0.0f;
     }
 
-// Load into registers
-// C = A * B
 #pragma unroll
     for (int n = 0; n < TILE_SIZE; n++) {
       acc += sh_a[cur][threadIdx.y][n] * sh_b[cur][n][threadIdx.x];
@@ -206,10 +242,108 @@ __global__ void shmem_gemm(const float *__restrict__ A,
     C[row * N + col] = acc;
 }
 
+constexpr int TILE_SIZE_REG = 32;
+constexpr int RM = 4;
+__global__ void registers_1d_gemm(const float *__restrict__ A,
+                                  const float *__restrict__ B,
+                                  float *__restrict__ C, int M, int N, int K) {
+
+  int base_row = TILE_SIZE_REG * blockIdx.y;
+  int base_col = TILE_SIZE_REG * blockIdx.x;
+
+  int col = threadIdx.x + base_col;
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
+
+  __shared__ float sh_a[2][TILE_SIZE_REG][TILE_SIZE_REG];
+  __shared__ float sh_b[2][TILE_SIZE_REG][TILE_SIZE_REG];
+  float acc[RM] = {0.0f};
+
+  // Load A and B
+  int tile_a_col = threadIdx.x;
+  int tile_b_row = threadIdx.y;
+#pragma unroll
+  for (int j = 0; j < RM; ++j) {
+    const int local_row = j * blockDim.y + threadIdx.y;
+    const int global_row = base_row + local_row;
+
+    if (global_row < M && tile_a_col < K)
+      sh_a[0][local_row][tile_a_col] = A[global_row * K + tile_a_col];
+    else
+      sh_a[0][local_row][tile_a_col] = 0.f;
+  }
+
+  for (int j = 0; j < TILE_SIZE_REG; j += blockDim.y) {
+    if (col < N && tile_b_row < K)
+      sh_b[0][ty + j][tx] = B[(tile_b_row + j) * N + col];
+    else
+      sh_b[0][ty + j][tx] = 0.0f;
+  }
+  __syncthreads();
+
+  int cur = 0;
+  for (int v = 0; v < K; v += TILE_SIZE_REG) {
+    int next = cur ^ 1;
+    if (v + TILE_SIZE_REG < K) {
+      tile_a_col = TILE_SIZE_REG + v + threadIdx.x;
+      tile_b_row = TILE_SIZE_REG + v + threadIdx.y;
+
+#pragma unroll
+      for (int j = 0; j < RM; ++j) {
+        const int local_row = j * blockDim.y + threadIdx.y;
+        const int global_row = base_row + local_row;
+
+        if (global_row < M && tile_a_col < K)
+          sh_a[next][local_row][tx] = A[global_row * K + tile_a_col];
+        else
+          sh_a[next][local_row][tx] = 0.f;
+      }
+
+      for (int j = 0; j < TILE_SIZE_REG; j += blockDim.y) {
+        if (col < N && tile_b_row < K)
+          sh_b[next][ty + j][tx] = B[(tile_b_row + j) * N + col];
+        else
+          sh_b[next][ty + j][tx] = 0.0f;
+      }
+    }
+
+#pragma unroll
+    for (int k = 0; k < TILE_SIZE_REG; k++) {
+#pragma unroll
+      for (int j = 0; j < RM; j++) {
+        const int local_row = j * blockDim.y + threadIdx.y;
+
+        acc[j] += sh_a[cur][local_row][k] * sh_b[cur][k][tx];
+      }
+    }
+    __syncthreads();
+    cur = next;
+  }
+
+#pragma unroll
+  for (int j = 0; j < RM; ++j) {
+    const int local_row = j * blockDim.y + threadIdx.y;
+    const int global_row = base_row + local_row;
+
+    if (global_row < M && col < N) {
+      C[global_row * N + col] = acc[j];
+    }
+  }
+}
+
 int main() {
   constexpr int M = 1024;
   constexpr int N = 512;
   constexpr int K = 128;
+
+  // constexpr int M = 64;
+  // constexpr int N = 64;
+  // constexpr int K = 64;
+
+  std::cout << "M: " << M << " ";
+  std::cout << "N: " << N << " ";
+  std::cout << "K: " << K << " ";
+  std::cout << std::endl;
 
   constexpr int a_size = M * K;
   constexpr int b_size = N * K;
@@ -219,13 +353,16 @@ int main() {
   std::vector<float> b_vec(b_size);
   std::vector<float> c_vec(c_size);
 
-  std::mt19937 rng;
-  std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-  std::generate(a_vec.begin(), a_vec.end(), [&]() { return dist(rng); });
-  std::generate(b_vec.begin(), b_vec.end(), [&]() { return dist(rng); });
+  // std::mt19937 rng;
+  // std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+  // std::generate(a_vec.begin(), a_vec.end(), [&]() { return dist(rng); });
+  // std::generate(b_vec.begin(), b_vec.end(), [&]() { return dist(rng); });
 
   // std::iota(a_vec.begin(), a_vec.end(), 0.f);
   // std::iota(b_vec.begin(), b_vec.end(), 1.f);
+
+  std::fill(a_vec.begin(), a_vec.end(), 1);
+  std::fill(b_vec.begin(), b_vec.end(), 1);
 
   float *a_data;
   float *b_data;
@@ -243,9 +380,15 @@ int main() {
   dim3 threads(TILE_SIZE, TILE_SIZE);
   dim3 blocks(safe_div(N, threads.x), safe_div(M, threads.y));
 
+  dim3 threads_reg(TILE_SIZE_REG, TILE_SIZE_REG / RM);
+  dim3 blocks_reg(safe_div(N, threads_reg.x), safe_div(M, threads_reg.y * RM));
+
   std::vector<KernelConfig> suite = {
       KernelConfig{"Naive", naive_gemm, blocks, threads},
       KernelConfig{"Shmem", shmem_gemm, blocks, threads},
+      KernelConfig{"Shmem (buffer)", buffered_shmem_gemm, blocks, threads},
+      KernelConfig{"registers (1D)", registers_1d_gemm, blocks_reg,
+                   threads_reg},
   };
 
   // Reuse host buffers you already have
