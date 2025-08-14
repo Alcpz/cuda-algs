@@ -339,66 +339,24 @@ __global__ void registers_2d_gemm(const float *__restrict__ A,
                                   float *__restrict__ C, int M, int N, int K) {
   int base_row = TILE_SIZE_REG_2D * blockIdx.y;
   int base_col = TILE_SIZE_REG_2D * blockIdx.x;
-
   int tx = threadIdx.x;
   int ty = threadIdx.y;
 
-  // __shared__ float sh_a[2][TILE_SIZE_REG_2D][TILE_SIZE_REG_2D];
-  // __shared__ float sh_b[2][TILE_SIZE_REG_2D][TILE_SIZE_REG_2D];
   __shared__ float sh_a[TILE_SIZE_REG_2D][TILE_SIZE_REG_2D];
   __shared__ float sh_b[TILE_SIZE_REG_2D][TILE_SIZE_REG_2D];
   float acc[RM][RN] = {0.0f};
 
-  // Load A and B
-  // for (int i = 0; i < RM; ++i) {
-  //   const int local_row = i * blockDim.y + threadIdx.y;
-  //   const int global_row = base_row + local_row;
-  //
-  //   const int tile_b_row = ty + i;
-  //   for (int j = 0; j < RN; ++j) {
-  //     const int local_col = j * blockDim.x + threadIdx.x;
-  //     const int global_col = base_col + local_col;
-  //
-  //     const int tile_a_col = tx + j;
-  //     if (global_row < M && tile_a_col < K)
-  //       sh_a[0][local_row][tx + j] = A[global_row * K + tile_a_col];
-  //     else
-  //       sh_a[0][local_row][tx + j] = 0.f;
-  //
-  //     if (global_col < N && tile_b_row < K)
-  //       sh_b[0][ty + i][local_col] = B[tile_b_row * N + global_col];
-  //     else
-  //       sh_b[0][ty + i][local_col] = 0.0f;
-  //   }
-  // }
-
-  __syncthreads();
-
-  // int cur = 0;
   for (int v = 0; v < K; v += TILE_SIZE_REG_2D) {
-    // int next = cur ^ 1;
-    // if (v + TILE_SIZE_REG_2D < K) {
     for (int i = 0; i < RM; ++i) {
       const int local_row = i * blockDim.y + threadIdx.y;
       const int global_row = base_row + local_row;
 
       const int tile_b_row = v + ty + i;
-      // const int tile_b_row = TILE_SIZE_REG_2D + v + ty + i;
       for (int j = 0; j < RN; ++j) {
         const int local_col = j * blockDim.x + threadIdx.x;
         const int global_col = base_col + local_col;
 
         const int tile_a_col = v + tx + j;
-        // const int tile_a_col = TILE_SIZE_REG_2D + v + tx + j;
-        // if (global_row < M && tile_a_col < K)
-        //   sh_a[next][local_row][tx + j] = A[global_row * K + tile_a_col];
-        // else
-        //   sh_a[next][local_row][tx + j] = 0.f;
-
-        // if (global_col < N && tile_b_row < K)
-        //   sh_b[next][ty + i][local_col] = B[tile_b_row * N + global_col];
-        // else
-        //   sh_b[next][ty + i][local_col] = 0.0f;
 
         if (global_row < M && tile_a_col < K)
           sh_a[local_row][tx + j] = A[global_row * K + tile_a_col];
@@ -411,7 +369,6 @@ __global__ void registers_2d_gemm(const float *__restrict__ A,
           sh_b[ty + i][local_col] = 0.0f;
       }
     }
-    // }
     __syncthreads();
 
     float reg_a[RM] = {0.0};
@@ -419,12 +376,10 @@ __global__ void registers_2d_gemm(const float *__restrict__ A,
     for (int k = 0; k < TILE_SIZE_REG_2D; k++) {
       for (int i = 0; i < RM; i++) {
         const int local_row = i * blockDim.y + threadIdx.y;
-        // reg_a[i] = sh_a[cur][local_row][k];
         reg_a[i] = sh_a[local_row][k];
       }
       for (int j = 0; j < RN; j++) {
         const int local_col = j * blockDim.x + threadIdx.x;
-        // reg_b[j] = sh_b[cur][k][local_col];
         reg_b[j] = sh_b[k][local_col];
       }
       for (int i = 0; i < RM; i++) {
@@ -435,7 +390,6 @@ __global__ void registers_2d_gemm(const float *__restrict__ A,
     }
 
     __syncthreads();
-    // cur = next;
   }
 
   for (int i = 0; i < RM; ++i) {
