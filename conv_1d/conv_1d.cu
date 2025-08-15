@@ -208,7 +208,7 @@ __global__ void conv_1d_regtile(const float *__restrict__ values,
   int out_size = size - k_size + 1;
   extern __shared__ float shmem[];
 
-  int shmem_size = 2 * blockDim.x + k_size - 1;
+  int shmem_size = RACC * blockDim.x + k_size - 1;
 
   int tx = threadIdx.x * RACC;
   int gx = (RACC * blockIdx.x * blockDim.x);
@@ -223,16 +223,22 @@ __global__ void conv_1d_regtile(const float *__restrict__ values,
     return;
 
   float acc[RACC] = {0.0f};
+  float vals[RACC];
   // Needs to avoid bank conflicts
-  float val0 = shmem[tx];
-  float val1 = shmem[tx + 1];
+  for (int r = 0; r < RACC; ++r) {
+    vals[r] = shmem[tx + r];
+  }
+
   for (int j = 0; j < k_size; ++j) {
     const float c_k_val = c_kern[j];
-    acc[0] = fmaf(val0, c_k_val, acc[0]);
-    acc[1] = fmaf(val1, c_k_val, acc[1]);
+    for (int r = 0; r < RACC; ++r) {
+      acc[r] = fmaf(vals[r], c_k_val, acc[r]);
+    }
     if (j + 1 < k_size) {
-      val0 = val1;
-      val1 = shmem[tx + j + 2];
+      for (int r = 0; r < RACC - 1; ++r) {
+        vals[r] = vals[r + 1];
+      }
+      vals[RACC - 1] = shmem[tx + j + RACC];
     }
   }
 
@@ -252,13 +258,14 @@ __global__ void conv_1d_vload(const float *__restrict__ values,
   int block_offset = blockIdx.x * blockDim.x;
   int global_i = blockIdx.x * blockDim.x + threadIdx.x;
 
-  for (int load_idx = threadIdx.x * 4; load_idx < shared_mem_size && load_idx + block_offset < size;
+  for (int load_idx = threadIdx.x * 4;
+       load_idx < shared_mem_size && load_idx + block_offset < size;
        load_idx += blockDim.x * 4) {
     int global_offset = block_offset + load_idx;
 
     const float4 data =
         *reinterpret_cast<const float4 *>(&values[global_offset]);
-    *reinterpret_cast<float4*>(&shmem[load_idx]) = data;
+    *reinterpret_cast<float4 *>(&shmem[load_idx]) = data;
   }
   __syncthreads();
 
@@ -271,11 +278,80 @@ __global__ void conv_1d_vload(const float *__restrict__ values,
   }
 }
 
+__constant__ float c_u[4];
+
+__global__ void conv_1d_winograd(const float *__restrict__ x,
+                                 const float *__restrict__,
+                                 float *__restrict__ y, int n, int) {
+  // out_len = n - 3 + 1 (valid)
+  const int out_len = n - 2; // since k=3
+  const int tx = threadIdx.x;
+  const int tid = blockIdx.x * blockDim.x + tx;
+
+  // This thread computes two outputs: base and base+1
+  const int base_out = tid * 2;
+  if (base_out >= out_len)
+    return;
+
+  // Each block loads a contiguous span of inputs into smem:
+  // span = 2*blockDim.x + 3 (four inputs per thread, overlap handled)
+  extern __shared__ float smem[];
+  const int block_in_start = blockIdx.x * (blockDim.x * 2);
+  const int span = 2 * blockDim.x + 3;
+
+  // Coalesced loads: two per thread
+  int p0 = 2 * tx;
+  int g0 = block_in_start + p0;
+  if (p0 < span)
+    smem[p0] = (g0 < n) ? x[g0] : 0.0f;
+
+  int p1 = p0 + 1;
+  int g1 = block_in_start + p1;
+  if (p1 < span)
+    smem[p1] = (g1 < n) ? x[g1] : 0.0f;
+
+  // Tail (3 extra) by first 3 threads
+  if (tx < 3) {
+    int p = 2 * blockDim.x + tx;
+    int g = block_in_start + p;
+    smem[p] = (g < n) ? x[g] : 0.0f;
+  }
+  __syncthreads();
+
+  // Local 4-sample tile for this thread
+  float d0 = smem[2 * tx + 0];
+  float d1 = smem[2 * tx + 1];
+  float d2 = smem[2 * tx + 2];
+  float d3 = smem[2 * tx + 3];
+
+  // Input transform: v = B^T d
+  // B^T = [[1,0,-1,0],[0,1,1,0],[0,-1,1,0],[0,1,0,-1]]
+  float v0 = d0 - d2;
+  float v1 = d1 + d2;
+  float v2 = d2 - d1;
+  float v3 = d1 - d3;
+
+  // Elementwise multiply with transformed kernel u = G g
+  float m0 = c_u[0] * v0;
+  float m1 = c_u[1] * v1;
+  float m2 = c_u[2] * v2;
+  float m3 = c_u[3] * v3;
+
+  // Output transform: y = A^T m
+  // A^T = [[1,1,1,0],[0,1,-1,-1]]
+  float y0 = m0 + m1 + m2;
+  float y1 = m1 - m2 - m3;
+
+  y[base_out] = y0;
+  if (base_out + 1 < out_len)
+    y[base_out + 1] = y1; // tail-safe for odd out_len
+}
+
 int main() {
 
   constexpr std::size_t num_threads = 256;
-  constexpr std::size_t conv_size = 1e7;
-  constexpr std::size_t kern_size = 256;
+  constexpr std::size_t conv_size = 2048;
+  constexpr std::size_t kern_size = 3;
 
   // constexpr std::size_t conv_size = 1024;
   // constexpr std::size_t kern_size = 12;
@@ -318,6 +394,19 @@ int main() {
   dim3 blocks_vload(safe_div(conv_size, threads.x));
   int shmem_vload = sizeof(float) * (num_threads + kern_size - 1);
 
+  float u[4];
+  // G = [[1,0,0],[1/2,1/2,1/2],[1/2,-1/2,1/2],[0,0,1]]
+  u[0] = kern[0];
+  u[1] = 0.5f * (kern[0] + kern[1] + kern[2]);
+  u[2] = 0.5f * (kern[0] - kern[1] + kern[2]);
+  u[3] = kern[2];
+  cudaMemcpyToSymbol(c_u, u, 4 * sizeof(float));
+
+  const int tiles = safe_div(res_size(conv_size, kern_size), kern_size - 1);
+  dim3 threads_wino(num_threads);
+  dim3 blocks_wino = (tiles + num_threads - 1) / num_threads;
+  const size_t shmem_wino = (2 * num_threads + 3) * sizeof(float);
+
   std::vector<KernelConfig> suite = {
       KernelConfig{"Naive", conv_1d, blocks, threads, 0},
       KernelConfig{"Shmem", conv_1d_shmem, blocks, threads, shmem_size},
@@ -326,6 +415,8 @@ int main() {
                    shmem_regs},
       KernelConfig{"VecLoads", conv_1d_vload, blocks_vload, threads_vload,
                    shmem_vload},
+      KernelConfig{"Winograd", conv_1d_winograd, blocks_wino, threads_wino,
+                   shmem_wino},
   };
 
   // Reuse host buffers you already have
