@@ -1,1 +1,1 @@
-The one who suffers the less suffers the bullying.
+Some cuda implmenentations to play around with optimizations.
